@@ -202,11 +202,9 @@ ErrCode ToolHeadDualExtruder::Init(MAC_t &mac, uint8_t mac_index) {
   ModuleCtrlPidSync();
   ModuleCtrlFilamentStateSync();
   ModuleCtrlHotendOffsetSync();
-  ModuleCtrlZProbeSensorCompensationSync();
   ModuleCtrlRightExtruderPosSync();
 
   CheckLevelingData();
-  ModuleCtrlHotendTypeSync();
 
   LOG_I("dualextruder ready!\n");
 
@@ -332,17 +330,17 @@ void ToolHeadDualExtruder::ReportHotendType(uint8_t *data) {
     }
   }
 
+  #ifdef USE_FDM_INTERRUPT_LOG
+    LOG_I("nozzle_index: 0, type: %d, diameter: %.2f\n", hotend_type_[0], hotend_diameter_[0]);
+    LOG_I("nozzle_index: 1, type: %d, diameter: %.2f\n", hotend_type_[1], hotend_diameter_[1]);
+  #endif
+
   if (hotend_type_[0] == INVALID_HOTEND_TYPE || hotend_type_[1] == INVALID_HOTEND_TYPE) {
     systemservice.ThrowException(EHOST_EXECUTOR, ETYPE_3DP2E_UNKNOWN_NOZZLE);
   }
   else {
     systemservice.ClearException(EHOST_EXECUTOR, ETYPE_3DP2E_UNKNOWN_NOZZLE);
   }
-
-  #ifdef USE_FDM_INTERRUPT_LOG
-    LOG_I("nozzle_index: 0, type: %d, diameter: %.2f\n", hotend_type_[0], hotend_diameter_[0]);
-    LOG_I("nozzle_index: 1, type: %d, diameter: %.2f\n", hotend_type_[1], hotend_diameter_[1]);
-  #endif
 }
 
 void ToolHeadDualExtruder::ReportExtruderInfo(uint8_t *data) {
@@ -477,7 +475,16 @@ ErrCode ToolHeadDualExtruder::SetFan(uint8_t fan_index, uint8_t speed, uint8_t d
 
   cmd.data   = buffer;
   cmd.length = index;
+
   fan_speed_[fan_index] = speed;
+  LOG_I("fan_index: %d, speed: %d\n", fan_index, fan_speed_[fan_index]);
+
+  // the current fdm_2extruder module synchronizes the left and right fans
+  if (fan_index >= 0 && fan_index <= 1) {
+    fan_speed_[0] = speed;
+    fan_speed_[1] = speed;
+  }
+
   return canhost.SendStdCmd(cmd, 0);
 }
 
@@ -499,27 +506,6 @@ ErrCode ToolHeadDualExtruder::SetHeater(int16_t target_temp, uint8_t extrude_ind
   target_temp_[extrude_index] = target_temp;
   LOG_I("Set T%d=%d\n", extrude_index, target_temp_[extrude_index]);
 
-  fan_e nozzle_fan_index = DUAL_EXTRUDER_NOZZLE_FAN;
-  uint8_t fan_speed = 0;
-  uint8_t fan_delay = 0;
-
-  if (target_temp >= 50) {
-    fan_speed = 255;
-  }
-  else {
-    // check if need to delay to turn off fan
-    if (cur_temp_[0] >= 150 || cur_temp_[1] >= 150) {
-      fan_speed = 0;
-      fan_delay = 120;
-    } else if (cur_temp_[0] >= 50 || cur_temp_[1] >= 50) {
-      fan_speed = 0;
-      fan_delay = 60;
-    } else {
-      fan_speed = 0;
-      fan_delay = 0;
-    }
-  }
-  SetFan((uint8_t)nozzle_fan_index, fan_speed, fan_delay);
 
   uint8_t buffer[2*EXTRUDERS];
   for (int i = 0; i < EXTRUDERS; i++) {
@@ -739,17 +725,18 @@ ErrCode ToolHeadDualExtruder::ModuleCtrlSaveZCompensation(float comp, uint32_t e
   uint8_t buffer[CAN_FRAME_SIZE];
   uint8_t index = 0;
 
-  index = 0;
   buffer[index++] = e;
 
-  // little ending
-  *(float *)(buffer + 1) = comp;
+  buffer[index++] = ((uint8_t *)&comp)[0];
+  buffer[index++] = ((uint8_t *)&comp)[1];
+  buffer[index++] = ((uint8_t *)&comp)[2];
+  buffer[index++] = ((uint8_t *)&comp)[3];
 
-  LOG_I("save compensation[%u]: %f\n", comp, e);
+  LOG_I("save compensation[%u]: %f\n", e, comp);
 
   cmd.id      = MODULE_FUNC_SET_PROBE_SENSOR_COMPENSATION;
   cmd.data    = buffer;
-  cmd.length  = index + 4;
+  cmd.length  = index;
 
   ret = canhost.SendStdCmd(cmd, 0);
 
@@ -807,7 +794,7 @@ void ToolHeadDualExtruder::SelectProbeSensor(probe_sensor_t sensor) {
 
 void ToolHeadDualExtruder::SetZCompensation(float comp, uint32_t e) {
   z_compensation_[e] = comp;
-  ModuleCtrlSaveZCompensation(z_compensation_[e], e);
+  ModuleCtrlSaveZCompensation(comp, e);
 }
 
 void ToolHeadDualExtruder::GetZCompensation(float &left_z_compensation, float &right_z_compensation) {
@@ -1103,8 +1090,6 @@ ErrCode ToolHeadDualExtruder::HmiRequestGetActiveExtruder(SSTP_Event_t &event) {
 }
 
 void ToolHeadDualExtruder::ShowInfo() {
-  ModuleCtrlHotendTypeSync();
-
   LOG_I("active_probe_sensor: %u\n", active_probe_sensor_);
   LOG_I("hotend_type: 0: %u, 1: %u\n", hotend_type_[0], hotend_type_[1]);
   LOG_I("hotend_diameter: 0: %.2f, 1:%.2f\n", hotend_diameter_[0], hotend_diameter_[1]);
@@ -1122,6 +1107,15 @@ void ToolHeadDualExtruder::Process() {
   if (hw_version_ == MODULE_HW_VER_INVALID) {
     GetHWVersion();
   }
+
+  if (!has_sync) {
+    has_sync = true;
+
+    ModuleCtrlHotendTypeSync();
+    ModuleCtrlZProbeSensorCompensationSync();
+  }
+
+  NozzleFanCtrlCheck();
 }
 
 bool ToolHeadDualExtruder::GetToolChangePrePosition(float *position, uint8_t size) {
